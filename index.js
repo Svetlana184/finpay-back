@@ -7,18 +7,29 @@ const jwt = require('jsonwebtoken')
 const path = require('path')
 
 const app = express()
+app.use(express.json())
+app.use(cors())
 
-// ==========================================
-// КОНФИГ
-// ==========================================
-const PORT = Number(process.env.PORT) || 3000
+const pool = new Pool({
+    user: process.env.DB_USER,
+    host: process.env.DB_HOST,
+    database: process.env.DB_NAME,
+    password: process.env.DB_PASSWORD,
+    port: process.env.DB_PORT,
+    options: `-c search_path=${process.env.DB_SCHEMA || 'finpay'}`
+})
+
+pool.on('connect', (client) => {
+    client.query(`SET search_path TO ${process.env.DB_SCHEMA || 'finpay'}`)
+})
+
 const JWT_SECRET = process.env.JWT_SECRET || process.env.DB_SECRET
-const DB_SCHEMA = process.env.DB_SCHEMA || 'public'   // ВАЖНО: латиница, не DB_SСHEMA
-const DEMO_OTP = process.env.DEMO_OTP || '123456'     // для демо, в prod — Redis/DB
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*'    // для общего доступа
+if (!JWT_SECRET) {
+    throw new Error('JWT_SECRET is required')
+}
 
-
-if (!JWT_SECRET) throw new Error('JWT_SECRET is required')
+const PORT = 3000
+const DEMO_OTP = process.env.DEMO_OTP || '123456'
 
 
 // =============================================================================
@@ -64,7 +75,7 @@ const authRouter = express.Router()
 // Регистрация
 authRouter.post('/register', async (req, res) => {
   try {
-    const { phone, fullName, password } = req.body
+    const { phone, fullName, password } = req.body || {}
     if (!phone || !password) {
       return res.status(400).json({ success: false, error: 'Телефон и пароль обязательны' })
     }
@@ -84,7 +95,8 @@ authRouter.post('/register', async (req, res) => {
 
       await client.query(
         `INSERT INTO user_profiles (user_id, preferred_language, preferred_currency) 
-         VALUES ($1, 'ru', 'RUB')`,
+         VALUES ($1, 'ru', 'RUB')
+         ON CONFLICT (user_id) DO NOTHING`,
         [userId]
       )
 
@@ -94,6 +106,7 @@ authRouter.post('/register', async (req, res) => {
       res.status(201).json({ success: true, data: { user: userRes.rows[0], token } })
     } catch (e) {
       await client.query('ROLLBACK')
+      console.error('DB error:', e.code, e.constraint, e.detail, e.message)
       if (e.code === '23505') {
         return res.status(409).json({ success: false, error: 'Пользователь с таким телефоном уже существует' })
       }
@@ -182,6 +195,51 @@ authRouter.post('/change-password', authenticateToken, async (req, res) => {
   }
 })
 
+// Обновление токена
+authRouter.post('/refresh-token', authenticateToken, async (req, res) => {
+  try {
+    const token = jwt.sign({ id: req.user.id, phone: req.user.phone }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ success: true, data: { token } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Восстановление пароля (запрос OTP на телефон)
+authRouter.post('/forgot-password', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ success: false, error: 'Телефон обязателен' });
+
+    const result = await pool.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+    }
+
+    // В реальном приложении — отправка SMS. В демо — возвращаем код.
+    const otp = DEMO_OTP;
+    res.json({ success: true, message: 'OTP отправлен на телефон', data: { otp } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Проверка OTP
+authRouter.post('/verify-otp', async (req, res) => {
+  try {
+    const { otp_code, phone } = req.body;
+    if (!otp_code || !phone) {
+      return res.status(400).json({ success: false, error: 'OTP и телефон обязательны' });
+    }
+    if (otp_code !== DEMO_OTP) {
+      return res.status(400).json({ success: false, error: 'Неверный OTP' });
+    }
+    res.json({ success: true, message: 'OTP подтверждён' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // =============================================================================
 // 3. USERS ROUTES
 // =============================================================================
@@ -225,6 +283,54 @@ userRouter.put('/me', authenticateToken, async (req, res) => {
     res.status(500).json({ success: false, error: error.message })
   }
 })
+
+// Включить/выключить биометрию
+userRouter.patch('/me/biometric', authenticateToken, async (req, res) => {
+  try {
+    const { biometric_enabled } = req.body;
+    if (typeof biometric_enabled !== 'boolean') {
+      return res.status(400).json({ success: false, error: 'biometric_enabled должен быть boolean' });
+    }
+    await pool.query(
+      `UPDATE user_profiles SET biometric_enabled = $1, updated_at = NOW() WHERE user_id = $2`,
+      [biometric_enabled, req.user.id]
+    );
+    res.json({ success: true, data: { biometric_enabled } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Смена языка
+userRouter.patch('/me/language', authenticateToken, async (req, res) => {
+  try {
+    const { language } = req.body;
+    const allowed = ['ru', 'en', 'es'];
+    if (!language || !allowed.includes(language)) {
+      return res.status(400).json({ success: false, error: `Допустимые языки: ${allowed.join(', ')}` });
+    }
+    await pool.query(
+      `UPDATE user_profiles SET preferred_language = $1, updated_at = NOW() WHERE user_id = $2`,
+      [language, req.user.id]
+    );
+    res.json({ success: true, data: { language } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Количество непрочитанных уведомлений
+userRouter.get('/me/notifications-count', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(*)::int as unread_count FROM notifications WHERE user_id = $1 AND is_read = FALSE`,
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 // =============================================================================
 // 4. CARDS ROUTES
@@ -323,6 +429,51 @@ cardRouter.delete('/:id', authenticateToken, async (req, res) => {
   }
 })
 
+cardRouter.post('/', authenticateToken, async (req, res) => {
+  try {
+    const { card_number, card_type, expires_at } = req.body;
+    if (!card_number || !card_type || !expires_at) {
+      return res.status(400).json({ success: false, error: 'Все поля обязательны' });
+    }
+    const result = await pool.query(
+      `INSERT INTO cards (user_id, card_number, card_type, balance, currency, status, expires_at)
+       VALUES ($1, $2, $3, 0, 'RUB', 'active', $4)
+       RETURNING id, card_type, RIGHT(card_number, 4) as last_4_digits, balance, currency, status, expires_at`,
+      [req.user.id, card_number, card_type, expires_at]
+    );
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ success: false, error: 'Карта с таким номером уже существует' });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Выписка по карте
+cardRouter.get('/:id/statements', authenticateToken, async (req, res) => {
+  try {
+    const { from, to, limit = '50' } = req.query;
+    let query = `
+      SELECT t.id, t.amount, t.currency, t.status, t.description, t.created_at,
+             t.counterparty_name, c.name as category_name
+      FROM transactions t
+      LEFT JOIN categories c ON t.category_id = c.id
+      WHERE t.account_id = $1
+    `;
+    const params = [req.params.id];
+    if (from) { params.push(from); query += ` AND t.created_at >= $${params.length}`; }
+    if (to) { params.push(to); query += ` AND t.created_at <= $${params.length}`; }
+    query += ` ORDER BY t.created_at DESC LIMIT $${params.length + 1}`;
+    params.push(parseInt(limit));
+
+    const result = await pool.query(query, params);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // =============================================================================
 // 5. TRANSACTIONS ROUTES
 // =============================================================================
@@ -356,6 +507,170 @@ transactionRouter.get('/', authenticateToken, async (req, res) => {
     const result = await pool.query(query, params)
     res.json({ success: true, data: result.rows })
   } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// Детали транзакции
+transactionRouter.get('/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT t.id, t.account_id, t.counterparty_account_id, t.counterparty_name,
+              t.category_id, t.amount, t.currency, t.status, t.description, t.created_at,
+              c.name AS category_name, c.icon AS category_icon, c.type AS category_type,
+              card.card_type || ' ' || RIGHT(card.card_number, 4) AS card_masked,
+              cp.card_type || ' ' || RIGHT(cp.card_number, 4) AS counterparty_card_masked
+       FROM transactions t
+       JOIN cards card ON t.account_id = card.id
+       LEFT JOIN cards cp ON t.counterparty_account_id = cp.id
+       LEFT JOIN categories c ON t.category_id = c.id
+       WHERE t.id = $1 AND card.user_id = $2`,
+      [req.params.id, req.user.id]
+    )
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Транзакция не найдена' })
+    }
+    res.json({ success: true, data: result.rows[0] })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// Перевод средств между картами/счетами
+transactionRouter.post('/transfer', authenticateToken, async (req, res) => {
+  try {
+    const { from_card_id, to_account, amount, recipient_name, description, save_beneficiary } = req.body || {}
+
+    // Валидация
+    if (!from_card_id || !to_account || !amount) {
+      return res.status(400).json({ success: false, error: 'from_card_id, to_account и amount обязательны' })
+    }
+    const numAmount = Number(amount)
+    if (!Number.isFinite(numAmount) || numAmount <= 0) {
+      return res.status(400).json({ success: false, error: 'Сумма должна быть больше 0' })
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+
+      // Проверка карты-источника
+      const fromRes = await client.query(
+        'SELECT id, user_id, balance, currency, status FROM cards WHERE id = $1',
+        [from_card_id]
+      )
+      if (fromRes.rows.length === 0) throw new Error('Карта-источник не найдена')
+      const fromCard = fromRes.rows[0]
+      if (fromCard.user_id !== req.user.id) throw new Error('Доступ запрещен')
+      if (fromCard.status !== 'active') throw new Error('Карта-источник не активна')
+      if (Number(fromCard.balance) < numAmount) throw new Error('Недостаточно средств')
+
+      // Ищем карту-получателя по номеру (to_account)
+      const toRes = await client.query(
+        'SELECT id, user_id, balance, currency, status FROM cards WHERE card_number = $1',
+        [to_account]
+      )
+      const toCard = toRes.rows[0] || null
+
+      // Создаём исходящую транзакцию
+      const desc = description || `Перевод ${recipient_name || ''}`.trim()
+      const outTx = await client.query(
+        `INSERT INTO transactions
+           (account_id, counterparty_account_id, counterparty_name, amount, currency, status, description)
+         VALUES ($1, $2, $3, $4, $5, 'completed', $6)
+         RETURNING id`,
+        [fromCard.id, toCard ? toCard.id : null, recipient_name || null, -numAmount, fromCard.currency, desc]
+      )
+      const outTxId = outTx.rows[0].id
+
+      // Списываем с источника
+      await client.query('UPDATE cards SET balance = balance - $1 WHERE id = $2', [numAmount, fromCard.id])
+
+      // Если карта получателя найдена — зачисляем и создаём входящую транзакцию
+      let inTxId = null
+      if (toCard) {
+        if (toCard.status !== 'active') throw new Error('Карта получателя не активна')
+        inTxId = (await client.query(
+          `INSERT INTO transactions
+             (account_id, counterparty_account_id, counterparty_name, amount, currency, status, description)
+           VALUES ($1, $2, $3, $4, $5, 'completed', $6)
+           RETURNING id`,
+          [toCard.id, fromCard.id, null, numAmount, toCard.currency, desc]
+        )).rows[0].id
+        await client.query('UPDATE cards SET balance = balance + $1 WHERE id = $2', [numAmount, toCard.id])
+      }
+
+      // Сохраняем получателя в справочник
+      if (save_beneficiary && recipient_name) {
+        await client.query(
+          `INSERT INTO transfer_recipients
+             (user_id, recipient_name, recipient_account, recipient_bank, last_transfer_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (user_id, recipient_account) DO UPDATE
+             SET recipient_name = EXCLUDED.recipient_name,
+                 recipient_bank = EXCLUDED.recipient_bank,
+                 last_transfer_at = NOW()`,
+          [req.user.id, recipient_name, to_account, null]
+        )
+      }
+
+      await client.query('COMMIT')
+      res.json({
+        success: true,
+        message: 'Перевод выполнен',
+        data: { transaction_id: outTxId, incoming_transaction_id: inTxId },
+      })
+    } catch (e) {
+      await client.query('ROLLBACK')
+      throw e
+    } finally {
+      client.release()
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+const beneficiaryRouter = express.Router()
+
+// Список получателей
+beneficiaryRouter.get('/', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, user_id, recipient_name, recipient_account, recipient_bank,
+              is_favorite, last_transfer_at, created_at
+       FROM transfer_recipients
+       WHERE user_id = $1
+       ORDER BY is_favorite DESC, last_transfer_at DESC NULLS LAST, recipient_name`,
+      [req.user.id]
+    )
+    res.json({ success: true, data: result.rows })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// Добавить получателя
+beneficiaryRouter.post('/', authenticateToken, async (req, res) => {
+  try {
+    const { recipient_name, recipient_account, recipient_bank } = req.body || {}
+    if (!recipient_name || !recipient_account) {
+      return res.status(400).json({ success: false, error: 'recipient_name и recipient_account обязательны' })
+    }
+
+    const result = await pool.query(
+      `INSERT INTO transfer_recipients
+         (user_id, recipient_name, recipient_account, recipient_bank)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, user_id, recipient_name, recipient_account, recipient_bank,
+                 is_favorite, last_transfer_at, created_at`,
+      [req.user.id, recipient_name, recipient_account, recipient_bank || null]
+    )
+    res.status(201).json({ success: true, data: result.rows[0] })
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ success: false, error: 'Получатель с таким счётом уже существует' })
+    }
     res.status(500).json({ success: false, error: error.message })
   }
 })
@@ -495,6 +810,95 @@ billRouter.post('/pay', authenticateToken, async (req, res) => {
 })
 
 // =============================================================================
+// 16. BILLS EXTENDED ROUTES
+// =============================================================================
+
+// Поиск счёта по коду
+billRouter.get('/find', authenticateToken, async (req, res) => {
+  try {
+    const { code } = req.query;
+    if (!code) {
+      return res.status(400).json({ success: false, error: 'Код счёта обязателен' });
+    }
+    const result = await pool.query(
+      `SELECT b.id, b.bill_number, b.total_amount, b.currency, b.status,
+              b.period_from, b.period_to, b.service_fee, b.tax, b.penalty,
+              b.due_date, b.issue_date,
+              bp.recipient_name, bp.recipient_address, bp.recipient_phone
+       FROM bills b
+       LEFT JOIN bill_profiles bp ON b.bill_profile_id = bp.id
+       WHERE b.bill_number = $1 OR bp.account_code = $1
+       LIMIT 1`,
+      [code]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Счёт не найден' });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Детали счёта
+billRouter.get('/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT b.*, bp.recipient_name, bp.recipient_address, bp.recipient_phone,
+              pr.name as provider_name, pr.category as provider_category
+       FROM bills b
+       LEFT JOIN bill_profiles bp ON b.bill_profile_id = bp.id
+       LEFT JOIN bill_providers pr ON b.provider_id = pr.id
+       WHERE b.id = $1`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Счёт не найден' });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+const taxBillRouter = express.Router();
+
+// Список налоговых счетов пользователя
+taxBillRouter.get('/', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, tax_type, tax_authority, user_tax_id, assessment_year,
+              object_description, object_address,
+              assessed_amount, penalty, discount, total_amount, currency,
+              status, issue_date, due_date, document_number, created_at, paid_at
+       FROM tax_bills
+       WHERE user_id = $1
+       ORDER BY due_date ASC`,
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Детали налогового счёта
+taxBillRouter.get('/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM tax_bills WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Налоговый счёт не найден' });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================================================
 // 7. ATMS ROUTES
 // =============================================================================
 
@@ -589,6 +993,674 @@ savingsRouter.get('/', authenticateToken, async (req, res) => {
 })
 
 // =============================================================================
+// 9. TRANSFER RECIPIENTS ROUTES
+// =============================================================================
+
+const transferRecipientRouter = express.Router();
+
+// Список получателей
+transferRecipientRouter.get('/', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, recipient_name, recipient_account, recipient_bank, transfer_type,
+              is_favorite, last_transfer_at, created_at
+       FROM transfer_recipients
+       WHERE user_id = $1
+       ORDER BY is_favorite DESC, created_at DESC`,
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Добавить получателя
+transferRecipientRouter.post('/', authenticateToken, async (req, res) => {
+  try {
+    const { recipient_name, recipient_account, recipient_bank, transfer_type } = req.body;
+    if (!recipient_name || !recipient_account) {
+      return res.status(400).json({ success: false, error: 'Имя и счёт обязательны' });
+    }
+    const result = await pool.query(
+      `INSERT INTO transfer_recipients (user_id, recipient_name, recipient_account, recipient_bank, transfer_type)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, recipient_name, recipient_account, recipient_bank, transfer_type, created_at`,
+      [req.user.id, recipient_name, recipient_account, recipient_bank || null, transfer_type || 'card_number']
+    );
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ success: false, error: 'Такой получатель уже существует' });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Удалить получателя
+transferRecipientRouter.delete('/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM transfer_recipients WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Получатель не найден' });
+    }
+    res.json({ success: true, message: 'Получатель удалён' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Расчёт комиссии перевода
+transferRecipientRouter.get('/fee', authenticateToken, async (req, res) => {
+  try {
+    const amount = parseFloat(req.query.amount || '0');
+    const fee = amount > 0 ? amount * 0.01 : 0; // 1% комиссия
+    res.json({ success: true, data: { amount, fee, fee_percent: 1 } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================================================
+// 10. TRANSFER ROUTES
+// =============================================================================
+
+const transferRouter = express.Router();
+
+// Перевод между картами
+transferRouter.post('/transfer', authenticateToken, async (req, res) => {
+  try {
+    const { from_card_id, to_account, amount, recipient_name, description, save_beneficiary } = req.body;
+
+    if (!from_card_id || !to_account || !amount || !recipient_name) {
+      return res.status(400).json({ success: false, error: 'Все поля обязательны' });
+    }
+    if (amount <= 0) {
+      return res.status(400).json({ success: false, error: 'Сумма должна быть больше 0' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Проверка карты отправителя
+      const cardRes = await client.query(
+        'SELECT id, balance, user_id, status FROM cards WHERE id = $1',
+        [from_card_id]
+      );
+      if (cardRes.rows.length === 0) throw new Error('Карта отправителя не найдена');
+      if (cardRes.rows[0].user_id !== req.user.id) throw new Error('Доступ запрещён');
+      if (cardRes.rows[0].status !== 'active') throw new Error('Карта не активна');
+      if (cardRes.rows[0].balance < amount) throw new Error('Недостаточно средств');
+
+      // Попытка найти карту получателя в системе
+      const recipientRes = await client.query(
+        `SELECT id, user_id FROM cards WHERE card_number = $1 OR RIGHT(card_number, 4) = $2`,
+        [to_account, to_account.slice(-4)]
+      );
+
+      let transactionId;
+
+      if (recipientRes.rows.length > 0) {
+        // Внутренний перевод: списать у отправителя, зачислить получателю
+        const recipientCard = recipientRes.rows[0];
+
+        const tx1 = await client.query(
+          `INSERT INTO transactions (account_id, counterparty_account_id, counterparty_name, amount, currency, status, description)
+           VALUES ($1, $2, $3, $4, 'RUB', 'completed', $5) RETURNING id`,
+          [from_card_id, recipientCard.id, recipient_name, -amount, description || 'Перевод']
+        );
+        transactionId = tx1.rows[0].id;
+
+        await client.query(
+          `INSERT INTO transactions (account_id, counterparty_account_id, counterparty_name, amount, currency, status, description)
+           VALUES ($1, $2, $3, $4, 'RUB', 'completed', $5)`,
+          [recipientCard.id, from_card_id, 'Перевод от вас', amount, description || 'Поступление']
+        );
+
+        await client.query('UPDATE cards SET balance = balance - $1 WHERE id = $2', [amount, from_card_id]);
+        await client.query('UPDATE cards SET balance = balance + $1 WHERE id = $2', [amount, recipientCard.id]);
+      } else {
+        // Внешний перевод: только списание
+        const tx = await client.query(
+          `INSERT INTO transactions (account_id, counterparty_name, amount, currency, status, description)
+           VALUES ($1, $2, $3, 'RUB', 'completed', $4) RETURNING id`,
+          [from_card_id, recipient_name, -amount, description || 'Перевод']
+        );
+        transactionId = tx.rows[0].id;
+
+        await client.query('UPDATE cards SET balance = balance - $1 WHERE id = $2', [amount, from_card_id]);
+      }
+
+      // Сохранить получателя в избранные
+      if (save_beneficiary) {
+        await client.query(
+          `INSERT INTO transfer_recipients (user_id, recipient_name, recipient_account, transfer_type, last_transfer_at)
+           VALUES ($1, $2, $3, 'card_number', NOW())
+           ON CONFLICT DO NOTHING`,
+          [req.user.id, recipient_name, to_account]
+        );
+      }
+
+      await client.query('COMMIT');
+      res.json({ success: true, data: { transactionId, new_balance: cardRes.rows[0].balance - amount } });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================================================
+// 11. SAVINGS EXTENDED ROUTES
+// =============================================================================
+
+// Создать новый вклад
+savingsRouter.post('/', authenticateToken, async (req, res) => {
+  try {
+    const { account_id, amount, term_months, interest_rate } = req.body;
+    if (!account_id || !amount || !term_months) {
+      return res.status(400).json({ success: false, error: 'account_id, amount и term_months обязательны' });
+    }
+    if (amount < 1000) {
+      return res.status(400).json({ success: false, error: 'Минимальная сумма вклада: 1000' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Проверка карты и баланса
+      const cardRes = await client.query(
+        'SELECT id, balance, user_id, status FROM cards WHERE id = $1',
+        [account_id]
+      );
+      if (cardRes.rows.length === 0) throw new Error('Карта не найдена');
+      if (cardRes.rows[0].user_id !== req.user.id) throw new Error('Доступ запрещён');
+      if (cardRes.rows[0].balance < amount) throw new Error('Недостаточно средств');
+
+      const startDate = new Date();
+      const endDate = new Date();
+      endDate.setMonth(endDate.getMonth() + parseInt(term_months));
+
+      const accRes = await client.query(
+        `INSERT INTO savings_accounts (user_id, account_number, account_type, balance, currency, interest_rate,
+         start_date, end_date, status, min_balance)
+         VALUES ($1, $2, 'deposit', $3, 'RUB', $4, $5, $6, 'active', 1000)
+         RETURNING id, account_number, balance, currency, interest_rate,
+                   TO_CHAR(start_date, 'DD/MM/YYYY') as start_date,
+                   TO_CHAR(end_date, 'DD/MM/YYYY') as end_date`,
+        [req.user.id, `DEP-${Date.now()}`, amount, interest_rate || 5.0, startDate, endDate]
+      );
+
+      // Списание с карты
+      await client.query('UPDATE cards SET balance = balance - $1 WHERE id = $2', [amount, account_id]);
+
+      await client.query(
+        `INSERT INTO transactions (account_id, counterparty_name, amount, currency, status, description)
+         VALUES ($1, 'Сберегательный счёт', $2, 'RUB', 'completed', 'Открытие вклада')`,
+        [account_id, -amount]
+      );
+
+      await client.query('COMMIT');
+      res.status(201).json({ success: true, data: accRes.rows[0] });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Детали вклада
+savingsRouter.get('/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, account_number, account_type, balance, currency, interest_rate,
+              TO_CHAR(start_date, 'DD/MM/YYYY') as start_date,
+              TO_CHAR(end_date, 'DD/MM/YYYY') as end_date,
+              EXTRACT(MONTH FROM age(end_date, start_date))::int as term_months,
+              status, min_balance
+       FROM savings_accounts
+       WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Вклад не найден' });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Пополнить вклад
+savingsRouter.post('/:id/topup', authenticateToken, async (req, res) => {
+  try {
+    const { amount, account_id } = req.body;
+    if (!amount || !account_id) {
+      return res.status(400).json({ success: false, error: 'amount и account_id обязательны' });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const accRes = await client.query(
+        `UPDATE savings_accounts SET balance = balance + $1, updated_at = NOW()
+         WHERE id = $2 AND user_id = $3 RETURNING id, balance`,
+        [amount, req.params.id, req.user.id]
+      );
+      if (accRes.rows.length === 0) throw new Error('Вклад не найден');
+      await client.query('UPDATE cards SET balance = balance - $1 WHERE id = $2', [amount, account_id]);
+      await client.query('COMMIT');
+      res.json({ success: true, data: accRes.rows[0] });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Снять со вклада
+savingsRouter.post('/:id/withdraw', authenticateToken, async (req, res) => {
+  try {
+    const { amount, account_id } = req.body;
+    if (!amount || !account_id) {
+      return res.status(400).json({ success: false, error: 'amount и account_id обязательны' });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const accRes = await client.query(
+        `UPDATE savings_accounts SET balance = balance - $1, updated_at = NOW()
+         WHERE id = $2 AND user_id = $3 AND balance >= $1 RETURNING id, balance`,
+        [amount, req.params.id, req.user.id]
+      );
+      if (accRes.rows.length === 0) throw new Error('Вклад не найден или недостаточно средств');
+      await client.query('UPDATE cards SET balance = balance + $1 WHERE id = $2', [amount, account_id]);
+      await client.query('COMMIT');
+      res.json({ success: true, data: accRes.rows[0] });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================================================
+// 12. BRANCHES ROUTES
+// =============================================================================
+
+const branchRouter = express.Router();
+
+branchRouter.get('/', async (req, res) => {
+  try {
+    const { city, limit = '50' } = req.query;
+    let query = `SELECT id, bank_name, address, city, country, latitude, longitude, working_hours, phone
+                 FROM branches WHERE is_active = true`;
+    const params = [];
+    if (city) {
+      params.push(city);
+      query += ` AND LOWER(city) = LOWER($${params.length})`;
+    }
+    query += ` ORDER BY bank_name LIMIT $${params.length + 1}`;
+    params.push(parseInt(limit));
+
+    const result = await pool.query(query, params);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================================================
+// 13. INTEREST RATES ROUTES
+// =============================================================================
+
+const interestRateRouter = express.Router();
+
+interestRateRouter.get('/', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, interest_kind, deposit_period, rate, currency
+       FROM interest_rates
+       WHERE is_active = true
+       ORDER BY interest_kind, CAST(REPLACE(deposit_period, 'm', '') AS INTEGER)`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================================================
+// 14. NOTIFICATIONS ROUTES
+// =============================================================================
+
+const notificationRouter = express.Router();
+
+// Список уведомлений
+notificationRouter.get('/', authenticateToken, async (req, res) => {
+  try {
+    const { limit = '50', unread_only } = req.query;
+    let query = `SELECT id, type, title, body, channel, is_read, read_at, action_url, created_at
+                 FROM notifications WHERE user_id = $1`;
+    const params = [req.user.id];
+    if (unread_only === 'true') {
+      query += ` AND is_read = FALSE`;
+    }
+    query += ` ORDER BY created_at DESC LIMIT $${params.length + 1}`;
+    params.push(parseInt(limit));
+
+    const result = await pool.query(query, params);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Детали уведомления
+notificationRouter.get('/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM notifications WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Уведомление не найдено' });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Отметить как прочитанное
+notificationRouter.patch('/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE notifications SET is_read = TRUE, read_at = NOW()
+       WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Уведомление не найдено' });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================================================
+// 15. MESSAGES ROUTES
+// =============================================================================
+
+const messageRouter = express.Router();
+
+// Список диалогов
+messageRouter.get('/', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT sc.id, sc.subject, sc.status, sc.created_at, sc.closed_at,
+              (SELECT COUNT(*) FROM support_messages WHERE conversation_id = sc.id AND sender_id != $1 AND is_read = FALSE)::int as unread_count,
+              (SELECT message_text FROM support_messages WHERE conversation_id = sc.id ORDER BY created_at DESC LIMIT 1) as last_message,
+              (SELECT created_at FROM support_messages WHERE conversation_id = sc.id ORDER BY created_at DESC LIMIT 1) as last_message_at
+       FROM support_conversations sc
+       WHERE sc.user_id = $1
+       ORDER BY (SELECT MAX(created_at) FROM support_messages WHERE conversation_id = sc.id) DESC`,
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Переписка (сообщения диалога)
+messageRouter.get('/:id', authenticateToken, async (req, res) => {
+  try {
+    // Проверка доступа
+    const convRes = await pool.query(
+      `SELECT id FROM support_conversations WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    if (convRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Диалог не найден' });
+    }
+
+    const result = await pool.query(
+      `SELECT sm.id, sm.message_text, sm.sender_id, sm.is_read, sm.created_at,
+              u.full_name as sender_name
+       FROM support_messages sm
+       JOIN users u ON sm.sender_id = u.id
+       WHERE sm.conversation_id = $1
+       ORDER BY sm.created_at ASC`,
+      [req.params.id]
+    );
+
+    // Отметить входящие как прочитанные
+    await pool.query(
+      `UPDATE support_messages SET is_read = TRUE
+       WHERE conversation_id = $1 AND sender_id != $2 AND is_read = FALSE`,
+      [req.params.id, req.user.id]
+    );
+
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Отправить сообщение
+messageRouter.post('/:id', authenticateToken, async (req, res) => {
+  try {
+    const { message_text } = req.body;
+    if (!message_text) {
+      return res.status(400).json({ success: false, error: 'Текст сообщения обязателен' });
+    }
+
+    // Проверка доступа
+    const convRes = await pool.query(
+      `SELECT id FROM support_conversations WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    if (convRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Диалог не найден' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO support_messages (conversation_id, sender_id, message_text)
+       VALUES ($1, $2, $3)
+       RETURNING id, message_text, sender_id, created_at`,
+      [req.params.id, req.user.id, message_text]
+    );
+
+    // Обновить статус диалога
+    await pool.query(
+      `UPDATE support_conversations SET status = 'in_progress' WHERE id = $1 AND status = 'open'`,
+      [req.params.id]
+    );
+
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================================================
+// 16. BENEFICIARIES ROUTES
+// =============================================================================
+
+// Список бенефициаров
+beneficiaryRouter.get('/', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, recipient_name, recipient_account, recipient_bank, branch_name,
+              transfer_type, avatar_url, created_at
+       FROM beneficiaries
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Добавить бенефициара
+beneficiaryRouter.post('/', authenticateToken, async (req, res) => {
+  try {
+    const { recipient_name, recipient_account, recipient_bank, branch_name, transfer_type, avatar_url } = req.body;
+    if (!recipient_name || !recipient_account) {
+      return res.status(400).json({ success: false, error: 'Имя и счёт обязательны' });
+    }
+    const result = await pool.query(
+      `INSERT INTO beneficiaries (user_id, recipient_name, recipient_account, recipient_bank, branch_name, transfer_type, avatar_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, recipient_name, recipient_account, recipient_bank, branch_name, transfer_type, created_at`,
+      [req.user.id, recipient_name, recipient_account, recipient_bank || null, branch_name || null, transfer_type || 'card_number', avatar_url || null]
+    );
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Удалить бенефициара
+beneficiaryRouter.delete('/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM beneficiaries WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Бенефициар не найден' });
+    }
+    res.json({ success: true, message: 'Бенефициар удалён' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================================================
+// 17. WITHDRAW ROUTES
+// =============================================================================
+
+const withdrawRouter = express.Router();
+
+// Заявка на снятие наличных
+withdrawRouter.post('/', authenticateToken, async (req, res) => {
+  try {
+    const { account_id, phone, amount } = req.body;
+    if (!account_id || !phone || !amount) {
+      return res.status(400).json({ success: false, error: 'account_id, phone и amount обязательны' });
+    }
+    if (amount <= 0) {
+      return res.status(400).json({ success: false, error: 'Сумма должна быть больше 0' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const cardRes = await client.query(
+        'SELECT id, balance, user_id, status FROM cards WHERE id = $1',
+        [account_id]
+      );
+      if (cardRes.rows.length === 0) throw new Error('Карта не найдена');
+      if (cardRes.rows[0].user_id !== req.user.id) throw new Error('Доступ запрещён');
+      if (cardRes.rows[0].status !== 'active') throw new Error('Карта не активна');
+      if (cardRes.rows[0].balance < amount) throw new Error('Недостаточно средств');
+
+      const result = await client.query(
+        `INSERT INTO withdraw_requests (user_id, account_id, phone, amount, status)
+         VALUES ($1, $2, $3, $4, 'pending')
+         RETURNING id, phone, amount, status, created_at`,
+        [req.user.id, account_id, phone, amount]
+      );
+
+      // Резервируем средства (списываем с карты)
+      await client.query('UPDATE cards SET balance = balance - $1 WHERE id = $2', [amount, account_id]);
+
+      await client.query('COMMIT');
+      res.status(201).json({ success: true, data: result.rows[0] });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================================================
+// 18. EXCHANGE EXTENDED ROUTES
+// =============================================================================
+
+// Конвертация валюты (создать запись о конвертации)
+exchangeRouter.post('/', authenticateToken, async (req, res) => {
+  try {
+    const { from_currency, to_currency, amount } = req.body;
+    if (!from_currency || !to_currency || !amount) {
+      return res.status(400).json({ success: false, error: 'Все поля обязательны' });
+    }
+
+    // Найти актуальный курс
+    const rateRes = await pool.query(
+      `SELECT rate FROM exchange_rates
+       WHERE currency_from = $1 AND currency_to = $2
+         AND is_active = true AND (valid_until IS NULL OR valid_until > NOW())
+       ORDER BY valid_from DESC LIMIT 1`,
+      [from_currency, to_currency]
+    );
+
+    if (rateRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Курс не найден' });
+    }
+
+    const rate = parseFloat(rateRes.rows[0].rate);
+    const converted = amount * rate;
+
+    res.json({
+      success: true,
+      data: {
+        from_currency,
+        to_currency,
+        amount: parseFloat(amount),
+        rate,
+        converted_amount: converted,
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+
+// =============================================================================
 // REGISTER ROUTES
 // =============================================================================
 
@@ -596,10 +1668,20 @@ app.use('/api/auth', authRouter)
 app.use('/api/users', userRouter)
 app.use('/api/cards', cardRouter)
 app.use('/api/transactions', transactionRouter)
+app.use('/api/beneficiaries', beneficiaryRouter) 
 app.use('/api/bills', billRouter)
 app.use('/api/atms', atmRouter)
 app.use('/api/exchange-rates', exchangeRouter)
 app.use('/api/savings', savingsRouter)
+app.use('/api/transfer-recipients', transferRecipientRouter);
+app.use('/api/transfer', transferRouter);
+app.use('/api/tax-bills', taxBillRouter);
+app.use('/api/branches', branchRouter);
+app.use('/api/interest-rates', interestRateRouter);
+app.use('/api/notifications', notificationRouter);
+app.use('/api/messages', messageRouter);
+app.use('/api/beneficiaries', beneficiaryRouter);
+app.use('/api/withdraw', withdrawRouter);
 
 // 404 handler
 app.use((req, res) => {
