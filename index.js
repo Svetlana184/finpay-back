@@ -236,6 +236,30 @@ authRouter.post('/verify-otp', async (req, res) => {
   }
 })
 
+// Сброс пароля по OTP
+authRouter.post('/reset-password', async (req, res) => {
+  try {
+    const { phone, otp_code, new_password } = req.body
+    if (!phone || !otp_code || !new_password) {
+      return res.status(400).json({ success: false, error: 'Все поля обязательны' })
+    }
+    if (new_password.length < 6) {
+      return res.status(400).json({ success: false, error: 'Пароль должен быть не менее 6 символов' })
+    }
+    if (otp_code !== DEMO_OTP) {
+      return res.status(400).json({ success: false, error: 'Неверный код подтверждения' })
+    }
+    const hashedPassword = await bcrypt.hash(new_password, 10)
+    await pool.query(
+      'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE phone = $2',
+      [hashedPassword, phone]
+    )
+    res.json({ success: true, message: 'Пароль успешно изменён' })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
 // =============================================================================
 // 3. USERS ROUTES
 // =============================================================================
@@ -887,6 +911,58 @@ billRouter.get('/:id', authenticateToken, async (req, res) => {
 })
 
 // =============================================================================
+// 10b. PAYMENT HISTORY ROUTE
+// =============================================================================
+billRouter.get('/payments-history', authenticateToken, async (req, res) => {
+  try {
+    const { type } = req.query // 'electric' | 'water' | 'mobile' | 'internet' | 'tax'
+
+    let query = `
+      SELECT 
+        bp.id,
+        bp.amount,
+        bp.currency,
+        bp.status,
+        bp.completed_at,
+        bp.created_at,
+        b.bill_number,
+        b.period_from,
+        b.period_to,
+        b.service_fee,
+        b.tax,
+        b.total_amount,
+        bp_recipient.recipient_name,
+        bp_recipient.recipient_address,
+        bp_recipient.recipient_phone,
+        pr.name as company_name,
+        pr.category as bill_category,
+        TO_CHAR(bp.completed_at, 'DD/MM/YYYY') as completed_date,
+        TO_CHAR(bp.completed_at, 'Month') as month_name,
+        EXTRACT(MONTH FROM bp.completed_at) as month_num,
+        EXTRACT(YEAR FROM bp.completed_at) as year_num
+      FROM bill_payments bp
+      LEFT JOIN bills b ON bp.bill_id = b.id
+      LEFT JOIN bill_profiles bp_recipient ON b.bill_profile_id = bp_recipient.id
+      LEFT JOIN bill_providers pr ON b.provider_id = pr.id
+      WHERE bp.user_id = $1
+    `
+    const params = [req.user.id]
+
+    if (type) {
+      params.push(type)
+      query += ` AND pr.category = $${params.length}`
+    }
+
+    query += ` ORDER BY bp.completed_at DESC`
+
+    const result = await pool.query(query, params)
+    res.json({ success: true, data: result.rows })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// =============================================================================
 // 6.1. TAX BILLS ROUTES
 // =============================================================================
 
@@ -1351,6 +1427,125 @@ messageRouter.post('/:id', authenticateToken, async (req, res) => {
 })
 
 // =============================================================================
+// MOBILE PREPAID ROUTES
+// =============================================================================
+const mobilePrepaidRouter = express.Router()
+
+mobilePrepaidRouter.post('/recharge', authenticateToken, async (req, res) => {
+  try {
+    const { account_id, phone, amount, otp_code, biometric_verified } = req.body
+    if (!account_id || !phone || !amount) {
+      return res.status(400).json({ success: false, error: 'account_id, phone и amount обязательны' })
+    }
+    if (amount <= 0) {
+      return res.status(400).json({ success: false, error: 'Сумма должна быть больше 0' })
+    }
+    // Верификация: OTP или биометрия
+    if (!biometric_verified && otp_code !== DEMO_OTP) {
+      return res.status(400).json({ success: false, error: 'Неверный код подтверждения' })
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const cardRes = await client.query(
+        'SELECT balance, user_id, status FROM cards WHERE id = $1', [account_id]
+      )
+      if (cardRes.rows.length === 0) throw new Error('Карта не найдена')
+      if (cardRes.rows[0].user_id !== req.user.id) throw new Error('Доступ запрещен')
+      if (cardRes.rows[0].status !== 'active') throw new Error('Карта не активна')
+      if (cardRes.rows[0].balance < amount) throw new Error('Недостаточно средств')
+
+      const txRes = await client.query(
+        `INSERT INTO transactions (account_id, counterparty_name, amount, currency, status, description)
+         VALUES ($1, $2, $3, 'RUB', 'completed', 'Пополнение мобильного')
+         RETURNING id`,
+        [account_id, phone, -amount]
+      )
+      await client.query('UPDATE cards SET balance = balance - $1 WHERE id = $2', [amount, account_id])
+      await client.query(
+        `INSERT INTO mobile_recharges (user_id, account_id, phone, amount)
+         VALUES ($1, $2, $3, $4)`,
+        [req.user.id, account_id, phone, amount]
+      )
+      await client.query('COMMIT')
+      res.json({ success: true, data: { transactionId: txRes.rows[0].id, new_balance: cardRes.rows[0].balance - amount } })
+    } catch (e) {
+      await client.query('ROLLBACK')
+      throw e
+    } finally {
+      client.release()
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// =============================================================================
+// BILL PROVIDERS ROUTES
+// =============================================================================
+const billProviderRouter = express.Router()
+
+// GET /api/bill-providers?type=internet
+billProviderRouter.get('/', authenticateToken, async (req, res) => {
+  try {
+    const { type } = req.query
+    let query = `SELECT id, name, code, category, logo_url, is_active, created_at
+                 FROM bill_providers WHERE is_active = true`
+    const params = []
+    if (type) {
+      params.push(type)
+      query += ` AND category = $${params.length}`
+    }
+    query += ` ORDER BY name`
+    const result = await pool.query(query, params)
+    res.json({ success: true, data: result.rows })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+app.use('/api/bill-providers', billProviderRouter)
+
+// =============================================================================
+// BILL FIND ROUTE (обновлённый — с provider_id)
+// =============================================================================
+billRouter.get('/find', authenticateToken, async (req, res) => {
+  try {
+    const { code, provider_id } = req.query
+    if (!code) {
+      return res.status(400).json({ success: false, error: 'Код счёта обязателен' })
+    }
+
+    let query = `SELECT b.id, b.bill_number, b.total_amount, b.currency, b.status,
+                        b.period_from, b.period_to, b.service_fee, b.tax, b.penalty,
+                        b.due_date, b.issue_date,
+                        bp.recipient_name, bp.recipient_address, bp.recipient_phone,
+                        bp.provider_id
+                 FROM bills b
+                 LEFT JOIN bill_profiles bp ON b.bill_profile_id = bp.id
+                 WHERE (b.bill_number = $1 OR bp.account_code = $1)`
+    const params = [code]
+
+    if (provider_id) {
+      params.push(provider_id)
+      query += ` AND bp.provider_id = $${params.length}`
+    }
+    query += ` LIMIT 1`
+
+    const result = await pool.query(query, params)
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Счёт не найден' })
+    }
+
+    res.json({ success: true, data: result.rows[0] })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// =============================================================================
 // REGISTER ROUTES
 // =============================================================================
 
@@ -1366,6 +1561,8 @@ app.use('/api/exchange-rates', exchangeRouter)
 app.use('/api/savings', savingsRouter)
 app.use('/api/notifications', notificationRouter)
 app.use('/api/messages', messageRouter)
+app.use('/api/mobile-prepaid', mobilePrepaidRouter)
+app.use('/api/bill-providers', billProviderRouter)
 
 // 404 handler
 app.use((req, res) => {
